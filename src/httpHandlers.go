@@ -1,11 +1,14 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 
 	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/shared"
 	"go.uber.org/zap"
 )
 
@@ -27,6 +30,11 @@ func HandleOpenaiModelsList(pool *ProvidersPool) http.HandlerFunc {
 	}
 }
 
+type OpenaiIncomingChatRequest struct {
+	openai.ChatCompletionNewParams      // Встраиваем все поля SDK
+	Stream                         bool `json:"stream"` // Добавляем наше поле для стриминга
+}
+
 func HandleOpenaiCompletions(pool *ProvidersPool, logger *zap.SugaredLogger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, err := io.ReadAll(r.Body)
@@ -36,7 +44,7 @@ func HandleOpenaiCompletions(pool *ProvidersPool, logger *zap.SugaredLogger) htt
 			return
 		}
 
-		var openaiRequest openai.ChatCompletionNewParams
+		var openaiRequest OpenaiIncomingChatRequest
 		if err := json.Unmarshal(bodyBytes, &openaiRequest); err != nil {
 			logger.Errorf("Failed to decode request: %v", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -56,7 +64,16 @@ func HandleOpenaiCompletions(pool *ProvidersPool, logger *zap.SugaredLogger) htt
 
 		logger.Infof("Pick model %s from provider %s", pickedProviderModel.Id, pickedProviderModel.ProviderRef.Name)
 
+		// 3. Готовим параметры для провайдера (встроенный ChatCompletionNewParams)
+		providerParams := openaiRequest.ChatCompletionNewParams
+		providerParams.Model = shared.ChatModel(pickedProviderModel.Id)
+
 		providerClient := pickedProviderModel.ProviderRef.Client
+
+		if openaiRequest.Stream {
+			handleStreaming(w, r, providerClient, providerParams, logger)
+			return
+		}
 
 		comp, err := providerClient.Chat.Completions.New(r.Context(), openai.ChatCompletionNewParams{
 			Model:    pickedProviderModel.Id,
@@ -75,5 +92,43 @@ func HandleOpenaiCompletions(pool *ProvidersPool, logger *zap.SugaredLogger) htt
 			// Примечание: если заголовки уже отправлены, http.Error тут не сработает корректно,
 			// но лог мы запишем.
 		}
+	}
+}
+
+func handleStreaming(w http.ResponseWriter, r *http.Request, client openai.Client, params openai.ChatCompletionNewParams, logger *zap.SugaredLogger) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	stream := client.Chat.Completions.NewStreaming(r.Context(), params)
+	defer stream.Close()
+
+	for stream.Next() {
+		chunk := stream.Current()
+		chunkJSON, err := json.Marshal(chunk)
+		if err != nil {
+			logger.Errorw("Failed to marshal chunk", "error", err)
+			continue
+		}
+		fmt.Fprintf(w, "data: %s\n\n", chunkJSON)
+		flusher.Flush()
+	}
+
+	if err := stream.Err(); err != nil {
+		if err == context.Canceled {
+			logger.Infow("Client disconnected")
+		} else {
+			logger.Errorw("Stream error", "error", err)
+		}
+	} else {
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
 	}
 }

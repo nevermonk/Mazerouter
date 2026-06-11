@@ -43,7 +43,7 @@ func main() {
 	logger.Infof("Provider pick strategy - %s", config.Settings.Providers.PickStrategy)
 	for _, p := range config.Providers {
 		provider := api.NewProvider(p.Name, p.Endpoint, p.APIKey, p.Settings.ModelAliases, logger)
-		provider.LoadModels()
+		go provider.LoadModels()
 
 		providerPool.Providers = append(providerPool.Providers, provider)
 	}
