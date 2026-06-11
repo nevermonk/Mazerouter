@@ -19,15 +19,12 @@ type ProviderConfig struct {
 	apiKey   string
 }
 
-type ProviderState struct {
-	Models []Model
-}
-
 type Provider struct {
-	Name   string
-	Config ProviderConfig
-	State  ProviderState
-	Client openai.Client
+	Name         string
+	Config       ProviderConfig
+	Models       []*Model
+	Client       openai.Client
+	ModelAliases map[string][]string
 
 	logger *zap.SugaredLogger
 }
@@ -43,11 +40,11 @@ func newProviderConfig(endpoint string, apiKey string) ProviderConfig {
 
 // Provider methods
 
-func NewProvider(name string, endpoint string, apiKey string, logger *zap.SugaredLogger) *Provider {
+func NewProvider(name string, endpoint string, apiKey string, modelAliases map[string][]string, logger *zap.SugaredLogger) *Provider {
 	return &Provider{
 		Name:   name,
 		Config: newProviderConfig(endpoint, apiKey),
-		State:  ProviderState{Models: []Model{}},
+		Models: []*Model{},
 		Client: openai.NewClient(
 			option.WithBaseURL(endpoint),
 			option.WithAPIKey(apiKey),
@@ -58,7 +55,8 @@ func NewProvider(name string, endpoint string, apiKey string, logger *zap.Sugare
 				},
 			}),
 		),
-		logger: logger,
+		ModelAliases: modelAliases,
+		logger:       logger,
 	}
 }
 
@@ -73,7 +71,11 @@ func (provider *Provider) LoadModels() {
 	// Iterate through the pages of models
 	for modelPage != nil {
 		for _, model := range modelPage.Data {
-			provider.State.Models = append(provider.State.Models, NewModel(model))
+			var modelAliases []string
+			if _, exists := provider.ModelAliases[model.ID]; exists {
+				modelAliases = append(modelAliases, provider.ModelAliases[model.ID]...)
+			}
+			provider.Models = append(provider.Models, NewModel(model, provider, modelAliases))
 		}
 
 		// Advance to the next page if more results exist
@@ -83,7 +85,7 @@ func (provider *Provider) LoadModels() {
 		}
 	}
 
-	provider.logger.Infof("Loaded total %d models from provider %s", len(provider.State.Models), provider.Name)
+	provider.logger.Infof("Loaded total %d models from provider %s", len(provider.Models), provider.Name)
 }
 
 // Обычный провайдер без доп логики

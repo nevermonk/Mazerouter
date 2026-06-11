@@ -1,32 +1,72 @@
 package api
 
+import (
+	"math/rand"
+	apiModels "megarouter/src/models"
+	"slices"
+)
+
 type ProvidersPool struct {
-	Providers []*Provider
+	Providers    []*Provider
+	PickStrategy string
 }
 
-type ModelsResponse struct {
-	Object string  `json:"object"`
-	Data   []Model `json:"data"`
+type ModelsBatch struct {
+	Models []*Model
 }
 
-func (pool *ProvidersPool) GetAllModels() ModelsResponse {
-	var models []Model
-	for _, provider := range pool.Providers {
-		models = append(models, provider.State.Models...)
+func (mb ModelsBatch) ToOpenaiModelsList() apiModels.OpenaiModelsList {
+	var openaiModels []apiModels.OpenaiModel
+	for _, model := range mb.Models {
+		openaiModels = append(openaiModels, model.ToOpenaiApiModel())
 	}
-	return ModelsResponse{
+	return apiModels.OpenaiModelsList{
 		Object: "list",
-		Data:   models,
+		Data:   openaiModels,
 	}
 }
 
-func (pool *ProvidersPool) FindByModel(modelID string) *Provider {
+func (mb ModelsBatch) ToMazeModelsList() apiModels.MazeModelsList {
+	var mazeModels []apiModels.MazeModel
+	for _, model := range mb.Models {
+		mazeModels = append(mazeModels, model.ToMazeApiModel())
+	}
+	return apiModels.MazeModelsList{
+		Models: mazeModels,
+	}
+}
+
+func (pool *ProvidersPool) GetAllModels() ModelsBatch {
+	var models []*Model
 	for _, provider := range pool.Providers {
-		for _, model := range provider.State.Models {
-			if model.ID == modelID {
-				return provider
+		models = append(models, provider.Models...)
+	}
+	return ModelsBatch{
+		Models: models,
+	}
+}
+
+func (pool *ProvidersPool) GetModelRoute(modelId string) *Model {
+	var candidates []*Model
+
+	for _, provider := range pool.Providers {
+		for _, model := range provider.Models {
+			if model.Id == modelId || slices.Contains(model.Aliases, modelId) {
+				candidates = append(candidates, model)
 			}
 		}
 	}
-	return nil
+
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	var selected *Model
+	if pool.PickStrategy == "random" {
+		selected = candidates[rand.Intn(len(candidates))]
+	} else {
+		selected = candidates[0]
+	}
+
+	return selected
 }

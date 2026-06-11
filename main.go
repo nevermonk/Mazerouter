@@ -1,10 +1,10 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"net/http"
 	"os"
+	"time"
 
 	api "megarouter/src"
 
@@ -12,16 +12,6 @@ import (
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
-
-type ProviderYAML struct {
-	Name     string `yaml:"name"`
-	Endpoint string `yaml:"endpoint"`
-	APIKey   string `yaml:"apiKey"`
-}
-
-type Config struct {
-	Providers []ProviderYAML `yaml:"providers"`
-}
 
 func main() {
 	loggerCfg := zap.NewProductionConfig()
@@ -49,9 +39,10 @@ func main() {
 		logger.Fatalf("Failed to parse config file: %v", err)
 	}
 
-	providerPool := api.ProvidersPool{}
+	providerPool := api.ProvidersPool{PickStrategy: config.Settings.Providers.PickStrategy}
+	logger.Infof("Provider pick strategy - %s", config.Settings.Providers.PickStrategy)
 	for _, p := range config.Providers {
-		provider := api.NewProvider(p.Name, p.Endpoint, p.APIKey, logger)
+		provider := api.NewProvider(p.Name, p.Endpoint, p.APIKey, p.Settings.ModelAliases, logger)
 		provider.LoadModels()
 
 		providerPool.Providers = append(providerPool.Providers, provider)
@@ -59,15 +50,69 @@ func main() {
 
 	logger.Info("Providers initial loading complete")
 
+	startServing(&providerPool, logger)
+}
+
+func startServing(providerPool *api.ProvidersPool, logger *zap.SugaredLogger) {
 	r := chi.NewRouter()
-	r.Get("/v1/models", func(w http.ResponseWriter, r *http.Request) {
-		models := providerPool.GetAllModels()
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(models)
-	})
+	r.Use(NewChiZapLoggerMiddleware(logger))
+
+	r.Get("/v1/models", api.HandleMazeModelsList(providerPool))
+	r.Get("/openai/v1/models", api.HandleOpenaiModelsList(providerPool))
+	r.Post("/openai/v1/chat/completions", api.HandleOpenaiCompletions(providerPool, logger))
 
 	logger.Info("Server starting on :8080")
 	if err := http.ListenAndServe(":8080", r); err != nil {
 		logger.Fatalf("Server failed: %v", err)
 	}
+}
+
+func NewChiZapLoggerMiddleware(logger *zap.SugaredLogger) func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			ww := &responseWriter{ResponseWriter: w, status: 200}
+			next.ServeHTTP(ww, r)
+			duration := time.Since(start)
+			logger.Infow("HTTP request",
+				zap.String("method", r.Method),
+				zap.String("path", r.URL.Path),
+				zap.Int("status", ww.status),
+				zap.Duration("duration", duration),
+			)
+		})
+	}
+}
+
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+type Config struct {
+	Providers []Provider `yaml:"providers"`
+	Settings  Settings   `yaml:"settings"`
+}
+type Provider struct {
+	Name     string           `yaml:"name"`
+	Endpoint string           `yaml:"endpoint"`
+	APIKey   string           `yaml:"apiKey"`
+	Settings ProviderSettings `yaml:"settings"`
+}
+
+type ProviderSettings struct {
+	ModelAliases map[string][]string `yaml:"modelAliases"`
+}
+
+type Settings struct {
+	Providers SettingsProviders `yaml:"providers"`
+}
+
+type SettingsProviders struct {
+	PickStrategy string `yaml:"pickStrategy"`
 }
