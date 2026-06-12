@@ -8,7 +8,6 @@ import (
 	"net/http"
 
 	"github.com/openai/openai-go/v3"
-	"github.com/openai/openai-go/v3/shared"
 	"go.uber.org/zap"
 )
 
@@ -30,105 +29,149 @@ func HandleOpenaiModelsList(pool *ProvidersPool) http.HandlerFunc {
 	}
 }
 
-type OpenaiIncomingChatRequest struct {
-	openai.ChatCompletionNewParams      // Встраиваем все поля SDK
-	Stream                         bool `json:"stream"` // Добавляем наше поле для стриминга
+type routeHint struct {
+	Model  string `json:"model"`
+	Stream bool   `json:"stream"`
 }
 
+// HandleOpenaiCompletions — главный хендлер /v1/chat/completions.
 func HandleOpenaiCompletions(pool *ProvidersPool, logger *zap.SugaredLogger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		bodyBytes, err := io.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			logger.Errorf("Failed to read request body: %v", err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "failed to read body")
 			return
 		}
 
-		var openaiRequest OpenaiIncomingChatRequest
-		if err := json.Unmarshal(bodyBytes, &openaiRequest); err != nil {
-			logger.Errorf("Failed to decode request: %v", err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		// 1. Быстрый парс только для выбора провайдера
+		var hint routeHint
+		if err := json.Unmarshal(body, &hint); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON")
 			return
 		}
 
-		logger.Infow("Incoming completions request",
-			zap.String("model", openaiRequest.Model),
+		route := pool.GetModelRoute(hint.Model)
+		if route == nil {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("no route for model %q", hint.Model))
+			return
+		}
+
+		logger.Infow("routing",
+			"incoming", hint.Model,
+			"provider", route.ProviderRef.Name,
+			"upstreamModel", route.Id,
+			"stream", hint.Stream,
 		)
 
-		pickedProviderModel := pool.GetModelRoute(openaiRequest.Model)
-
-		if pickedProviderModel == nil {
-			http.Error(w, "No provider found for model", http.StatusNotFound)
+		// 2. Полный парс — напрямую в SDK-тип, без встраивания.
+		// ChatCompletionNewParams поддерживает UnmarshalJSON через apijson.
+		var params openai.ChatCompletionNewParams
+		if err := json.Unmarshal(body, &params); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid params: "+err.Error())
 			return
 		}
+		// Подменяем model на upstream ID
+		params.Model = openai.ChatModel(route.Id)
 
-		logger.Infof("Pick model %s from provider %s", pickedProviderModel.Id, pickedProviderModel.ProviderRef.Name)
-
-		// 3. Готовим параметры для провайдера (встроенный ChatCompletionNewParams)
-		providerParams := openaiRequest.ChatCompletionNewParams
-		providerParams.Model = shared.ChatModel(pickedProviderModel.Id)
-
-		providerClient := pickedProviderModel.ProviderRef.Client
-
-		if openaiRequest.Stream {
-			handleStreaming(w, r, providerClient, providerParams, logger)
-			return
-		}
-
-		comp, err := providerClient.Chat.Completions.New(r.Context(), openai.ChatCompletionNewParams{
-			Model:    pickedProviderModel.Id,
-			Messages: openaiRequest.Messages,
-		})
-
-		if err != nil {
-			logger.Errorw("Provider request failed", "error", err, "provider", pickedProviderModel.ProviderRef.Name)
-			http.Error(w, "Provider error", http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(comp); err != nil {
-			logger.Errorw("Failed to encode response", "error", err)
-			// Примечание: если заголовки уже отправлены, http.Error тут не сработает корректно,
-			// но лог мы запишем.
+		if hint.Stream {
+			serveStream(w, r.Context(), route.ProviderRef.Client, params, logger)
+		} else {
+			serveCompletion(w, r.Context(), route.ProviderRef.Client, params, logger)
 		}
 	}
 }
 
-func handleStreaming(w http.ResponseWriter, r *http.Request, client openai.Client, params openai.ChatCompletionNewParams, logger *zap.SugaredLogger) {
+func serveCompletion(
+	w http.ResponseWriter,
+	ctx context.Context,
+	client openai.Client,
+	params openai.ChatCompletionNewParams,
+	logger *zap.SugaredLogger,
+) {
+	resp, err := client.Chat.Completions.New(ctx, params)
+	if err != nil {
+		logger.Errorw("upstream error", "error", err)
+		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		logger.Errorw("encode response error", "error", err)
+	}
+}
+
+func serveStream(
+	w http.ResponseWriter,
+	ctx context.Context,
+	client openai.Client,
+	params openai.ChatCompletionNewParams,
+	logger *zap.SugaredLogger,
+) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+	rc := http.NewResponseController(w)
+
+	// Проверяем поддержку flush через контроллер (разворачивает middleware-цепочку)
+	if err := rc.Flush(); err != nil {
+		logger.Errorw("flush not supported", "error", err)
 		return
 	}
 
-	stream := client.Chat.Completions.NewStreaming(r.Context(), params)
+	stream := client.Chat.Completions.NewStreaming(ctx, params)
 	defer stream.Close()
 
 	for stream.Next() {
 		chunk := stream.Current()
-		chunkJSON, err := json.Marshal(chunk)
+
+		// 🔍 ОТЛАДКА: Логируем сырой контент аргументов
+		if len(chunk.Choices) > 0 && len(chunk.Choices[0].Delta.ToolCalls) > 0 {
+			for _, tc := range chunk.Choices[0].Delta.ToolCalls {
+				if tc.Function.Arguments != "" {
+					logger.Infow("raw arguments chunk",
+						"name", tc.Function.Name,
+						"raw_bytes", string(tc.Function.Arguments), // Покажет сырые байты
+					)
+				}
+			}
+		}
+		data, err := json.Marshal(chunk)
 		if err != nil {
-			logger.Errorw("Failed to marshal chunk", "error", err)
+			logger.Errorw("marshal chunk error", "error", err)
 			continue
 		}
-		fmt.Fprintf(w, "data: %s\n\n", chunkJSON)
-		flusher.Flush()
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		rc.Flush() // игнорируем ошибку в hot-path — клиент мог отключиться
 	}
 
-	if err := stream.Err(); err != nil {
-		if err == context.Canceled {
-			logger.Infow("Client disconnected")
-		} else {
-			logger.Errorw("Stream error", "error", err)
-		}
-	} else {
+	switch err := stream.Err(); {
+	case err == nil:
 		fmt.Fprint(w, "data: [DONE]\n\n")
-		flusher.Flush()
+		rc.Flush()
+	case err == context.Canceled:
+		logger.Infow("client disconnected")
+	default:
+		logger.Errorw("stream error", "error", err)
+		errJSON, _ := json.Marshal(map[string]any{
+			"error": map[string]string{"message": err.Error(), "type": "stream_error"},
+		})
+		fmt.Fprintf(w, "data: %s\n\n", errJSON)
+		rc.Flush()
 	}
+}
+
+// writeError — OpenAI-совместимый JSON-ответ с ошибкой.
+func writeError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]string{
+			"message": msg,
+			"type":    "proxy_error",
+		},
+	})
 }
