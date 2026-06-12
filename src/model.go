@@ -13,6 +13,8 @@ type Model struct {
 	ProviderRef *Provider
 	Aliases     []string
 
+	Awailable bool // влияет на участие модели в роутинге
+
 	latency time.Time
 }
 
@@ -22,6 +24,7 @@ func NewModel(obj openai.Model, provider *Provider, aliases []string) *Model {
 		OpenaiObj:   obj,
 		ProviderRef: provider,
 		Aliases:     aliases,
+		Awailable:   true,
 	}
 
 }

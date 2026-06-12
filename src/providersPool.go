@@ -51,7 +51,7 @@ func (pool *ProvidersPool) GetModelRoute(modelId string) *Model {
 
 	for _, provider := range pool.Providers {
 		for _, model := range provider.Models {
-			if model.Id == modelId || slices.Contains(model.Aliases, modelId) {
+			if (model.Id == modelId || slices.Contains(model.Aliases, modelId)) && model.Awailable {
 				candidates = append(candidates, model)
 			}
 		}

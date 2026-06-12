@@ -143,19 +143,14 @@ func serveStream(
 			)
 		}
 
-		// Send the accumulated response as a complete chunk
-		// This ensures client gets valid JSON with complete tool call data
-		data, err := json.Marshal(completionsAccumulator.ChatCompletion)
+		data, err := json.Marshal(chunk)
 		if err != nil {
-			logger.Errorw("marshal accumulated error", "error", err)
+			logger.Errorw("marshal chunk error", "error", err)
 			continue
 		}
 
-		// Only send if there's content
-		if hasAccumulatedContent(completionsAccumulator.ChatCompletion) {
-			fmt.Fprintf(w, "data: %s\n\n", data)
-			rc.Flush()
-		}
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		rc.Flush()
 
 	}
 
