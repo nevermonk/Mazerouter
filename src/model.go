@@ -1,7 +1,7 @@
 package api
 
 import (
-	apiModels "megarouter/src/models"
+	apiModels "mazerouter/src/models"
 	"time"
 
 	"github.com/openai/openai-go/v3"

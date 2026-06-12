@@ -125,27 +125,38 @@ func serveStream(
 	stream := client.Chat.Completions.NewStreaming(ctx, params)
 	defer stream.Close()
 
+	completionsAccumulator := openai.ChatCompletionAccumulator{}
+
 	for stream.Next() {
 		chunk := stream.Current()
 
-		// 🔍 ОТЛАДКА: Логируем сырой контент аргументов
-		if len(chunk.Choices) > 0 && len(chunk.Choices[0].Delta.ToolCalls) > 0 {
-			for _, tc := range chunk.Choices[0].Delta.ToolCalls {
-				if tc.Function.Arguments != "" {
-					logger.Infow("raw arguments chunk",
-						"name", tc.Function.Name,
-						"raw_bytes", string(tc.Function.Arguments), // Покажет сырые байты
-					)
-				}
-			}
-		}
-		data, err := json.Marshal(chunk)
-		if err != nil {
-			logger.Errorw("marshal chunk error", "error", err)
+		if !completionsAccumulator.AddChunk(chunk) {
+			logger.Errorw("failed to accumulate chunk", "error", stream.Err())
 			continue
 		}
-		fmt.Fprintf(w, "data: %s\n\n", data)
-		rc.Flush() // игнорируем ошибку в hot-path — клиент мог отключиться
+
+		// Check if a tool call just finished - useful for logging
+		if finished, ok := completionsAccumulator.JustFinishedToolCall(); ok {
+			logger.Infow("tool call completed",
+				"name", finished.Name,
+				"args", finished.Arguments,
+			)
+		}
+
+		// Send the accumulated response as a complete chunk
+		// This ensures client gets valid JSON with complete tool call data
+		data, err := json.Marshal(completionsAccumulator.ChatCompletion)
+		if err != nil {
+			logger.Errorw("marshal accumulated error", "error", err)
+			continue
+		}
+
+		// Only send if there's content
+		if hasAccumulatedContent(completionsAccumulator.ChatCompletion) {
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			rc.Flush()
+		}
+
 	}
 
 	switch err := stream.Err(); {
@@ -162,6 +173,17 @@ func serveStream(
 		fmt.Fprintf(w, "data: %s\n\n", errJSON)
 		rc.Flush()
 	}
+}
+
+// hasAccumulatedContent checks if accumulated response has meaningful content
+func hasAccumulatedContent(cc openai.ChatCompletion) bool {
+	if len(cc.Choices) == 0 {
+		return false
+	}
+	msg := cc.Choices[0].Message
+	return msg.Content != "" ||
+		msg.Role != "" ||
+		len(msg.ToolCalls) > 0
 }
 
 // writeError — OpenAI-совместимый JSON-ответ с ошибкой.

@@ -2,7 +2,7 @@ package api
 
 import (
 	"math/rand"
-	apiModels "megarouter/src/models"
+	apiModels "mazerouter/src/models"
 	"slices"
 )
 
