@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -34,6 +35,11 @@ type routeHint struct {
 	Stream bool   `json:"stream"`
 }
 
+type servingError struct {
+	StatusCode  int
+	ErrorReason string
+}
+
 // HandleOpenaiCompletions — главный хендлер /v1/chat/completions.
 func HandleOpenaiCompletions(pool *ProvidersPool, logger *zap.SugaredLogger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -50,19 +56,6 @@ func HandleOpenaiCompletions(pool *ProvidersPool, logger *zap.SugaredLogger) htt
 			return
 		}
 
-		route := pool.GetModelRoute(hint.Model)
-		if route == nil {
-			writeError(w, http.StatusNotFound, fmt.Sprintf("no route for model %q", hint.Model))
-			return
-		}
-
-		logger.Infow("routing",
-			"incoming", hint.Model,
-			"provider", route.ProviderRef.Name,
-			"upstreamModel", route.Id,
-			"stream", hint.Stream,
-		)
-
 		// 2. Полный парс — напрямую в SDK-тип, без встраивания.
 		// ChatCompletionNewParams поддерживает UnmarshalJSON через apijson.
 		var params openai.ChatCompletionNewParams
@@ -70,14 +63,47 @@ func HandleOpenaiCompletions(pool *ProvidersPool, logger *zap.SugaredLogger) htt
 			writeError(w, http.StatusBadRequest, "invalid params: "+err.Error())
 			return
 		}
-		// Подменяем model на upstream ID
-		params.Model = openai.ChatModel(route.Id)
 
-		if hint.Stream {
-			serveStream(w, r.Context(), route.ProviderRef.Client, params, logger)
-		} else {
-			serveCompletion(w, r.Context(), route.ProviderRef.Client, params, logger)
+		serveCompletionRequest(
+			pool, w, r, hint, params, logger,
+		)
+	}
+}
+
+func serveCompletionRequest(
+	pool *ProvidersPool,
+	w http.ResponseWriter,
+	r *http.Request,
+	hint routeHint,
+	params openai.ChatCompletionNewParams,
+	logger *zap.SugaredLogger,
+) {
+	pickedModel := pool.GetModelRoute(hint.Model)
+	if pickedModel == nil {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("no route for model %q", hint.Model))
+		return
+	}
+
+	logger.Infow("routing",
+		"incoming", hint.Model,
+		"provider", pickedModel.ProviderRef.Name,
+		"upstreamModel", pickedModel.Id,
+		"stream", hint.Stream,
+	)
+	// Подменяем model на upstream ID
+	params.Model = openai.ChatModel(pickedModel.Id)
+
+	if hint.Stream {
+		if ok, se := serveStream(w, r.Context(), pickedModel.ProviderRef.Client, params, logger); !ok {
+			logger.Errorf("Model %s of provider %s failed with status code %s and reason '%s'", pickedModel.Id, pickedModel.ProviderRef.Name, se.StatusCode, se.ErrorReason)
+			pickedModel.Awailable = false // показываем, что модель недоступна TBD: проверка доступности
+			serveCompletionRequest(
+				pool, w, r, hint, params, logger,
+			) // рекурсивно перезапускаемся
+			return
 		}
+	} else {
+		serveCompletion(w, r.Context(), pickedModel.ProviderRef.Client, params, logger)
 	}
 }
 
@@ -87,18 +113,25 @@ func serveCompletion(
 	client openai.Client,
 	params openai.ChatCompletionNewParams,
 	logger *zap.SugaredLogger,
-) {
+) (bool, servingError) {
 	resp, err := client.Chat.Completions.New(ctx, params)
 	if err != nil {
 		logger.Errorw("upstream error", "error", err)
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
-		return
+		var apiErr *openai.Error
+		errors.As(err, &apiErr)
+		return false, servingError{
+			StatusCode:  apiErr.StatusCode,
+			ErrorReason: "Upstream Error",
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		logger.Errorw("encode response error", "error", err)
 	}
+
+	return true, servingError{}
 }
 
 func serveStream(
@@ -107,7 +140,7 @@ func serveStream(
 	client openai.Client,
 	params openai.ChatCompletionNewParams,
 	logger *zap.SugaredLogger,
-) {
+) (bool, servingError) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -119,7 +152,9 @@ func serveStream(
 	// Проверяем поддержку flush через контроллер (разворачивает middleware-цепочку)
 	if err := rc.Flush(); err != nil {
 		logger.Errorw("flush not supported", "error", err)
-		return
+		return false, servingError{
+			ErrorReason: "Streaming unsupported for model",
+		}
 	}
 
 	stream := client.Chat.Completions.NewStreaming(ctx, params)
@@ -127,31 +162,27 @@ func serveStream(
 
 	completionsAccumulator := openai.ChatCompletionAccumulator{}
 
-	for stream.Next() {
-		chunk := stream.Current()
+	if !stream.Next() {
+		// обарабатываем ошибку при попытке получить первый чанк
+		err := stream.Err()
 
-		if !completionsAccumulator.AddChunk(chunk) {
-			logger.Errorw("failed to accumulate chunk", "error", stream.Err())
-			continue
+		var apiErr *openai.Error
+		errors.As(err, &apiErr)
+
+		if apiErr.StatusCode == 429 {
+			return false, servingError{
+				StatusCode:  429,
+				ErrorReason: "Too many requests for model",
+			}
 		}
-
-		// Check if a tool call just finished - useful for logging
-		if finished, ok := completionsAccumulator.JustFinishedToolCall(); ok {
-			logger.Infow("tool call completed",
-				"name", finished.Name,
-				"args", finished.Arguments,
-			)
+		stream.Close()
+	} else {
+		firstChunk := stream.Current()
+		sendStreamChunk(w, rc, firstChunk, &completionsAccumulator, logger)
+		for stream.Next() {
+			chunk := stream.Current()
+			sendStreamChunk(w, rc, chunk, &completionsAccumulator, logger)
 		}
-
-		data, err := json.Marshal(chunk)
-		if err != nil {
-			logger.Errorw("marshal chunk error", "error", err)
-			continue
-		}
-
-		fmt.Fprintf(w, "data: %s\n\n", data)
-		rc.Flush()
-
 	}
 
 	switch err := stream.Err(); {
@@ -168,6 +199,36 @@ func serveStream(
 		fmt.Fprintf(w, "data: %s\n\n", errJSON)
 		rc.Flush()
 	}
+
+	return true, servingError{}
+}
+
+func sendStreamChunk(
+	w http.ResponseWriter,
+	rc *http.ResponseController,
+	chunk openai.ChatCompletionChunk,
+	acc *openai.ChatCompletionAccumulator,
+	logger *zap.SugaredLogger,
+) {
+	if !acc.AddChunk(chunk) {
+		logger.Errorw("failed to accumulate chunk")
+	}
+
+	// Check if a tool call just finished - useful for logging
+	if finished, ok := acc.JustFinishedToolCall(); ok {
+		logger.Infow("tool call completed",
+			"name", finished.Name,
+			"args", finished.Arguments,
+		)
+	}
+
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		logger.Errorw("marshal chunk error", "error", err)
+		return
+	}
+	fmt.Fprintf(w, "data: %s\n\n", data)
+	rc.Flush()
 }
 
 // hasAccumulatedContent checks if accumulated response has meaningful content
