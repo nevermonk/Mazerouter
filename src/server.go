@@ -19,9 +19,10 @@ type ServingError struct {
 
 // Результат запроса для non stream запросов
 type CompletionResult struct {
-	Data []byte
-	OK   bool
-	Err  ServingError
+	Data     []byte
+	Response openai.ChatCompletion
+	OK       bool
+	Err      ServingError
 }
 
 // Результат запроса для stream
@@ -34,6 +35,7 @@ type StreamResult struct {
 	ReadyForProcessing chan struct{}
 	OK                 *atomic.Bool
 	Err                *atomic.Pointer[ServingError]
+	Usage              *atomic.Pointer[openai.CompletionUsage]
 }
 
 func ServeCompletionRequest(
@@ -101,6 +103,10 @@ func ServeCompletionRequest(
 			}
 		}
 		fmt.Fprint(w, "data: [DONE]\n\n")
+
+		if u := result.Usage.Load(); u != nil {
+			logger.Infof("Total tokens used for stream request for provider %s is %d", pickedModel.ProviderRef.Name, u.TotalTokens)
+		}
 		_ = rc.Flush()
 		return
 	} else { // non stream запрос
@@ -124,17 +130,9 @@ func ServeCompletion(
 	resp, err := client.Chat.Completions.New(ctx, params)
 	if err != nil {
 		logger.Errorw("upstream error", "error", err)
-		statusCode := 0
-		var apiErr *openai.Error
-		if errors.As(err, &apiErr) {
-			statusCode = apiErr.StatusCode
-		}
 		return CompletionResult{
-			OK: false,
-			Err: ServingError{
-				StatusCode:  statusCode,
-				ErrorReason: "Upstream Error",
-			},
+			OK:  false,
+			Err: classifyError(err),
 		}
 	}
 
@@ -144,7 +142,7 @@ func ServeCompletion(
 		return CompletionResult{OK: false}
 	}
 
-	return CompletionResult{Data: data, OK: true}
+	return CompletionResult{Data: data, Response: *resp, OK: true}
 }
 
 func ServeStream(
@@ -154,45 +152,39 @@ func ServeStream(
 	logger *zap.SugaredLogger,
 ) StreamResult {
 	stream := client.Chat.Completions.NewStreaming(ctx, params)
-	// Buffered so the producer rarely blocks on the first send before
-	// the consumer starts reading.
-	chunks := make(chan []byte, 64)              // труба выдерживает 64 символа
-	readyForProcessing := make(chan struct{}, 1) // это просто сигнал для upstream reader'а, что мы готовы начать работу с результатом стрима (положительным или нет)
+	chunks := make(chan []byte, 64)
+	readyForProcessing := make(chan struct{}, 1)
 
 	ok := &atomic.Bool{}
 	se := &atomic.Pointer[ServingError]{}
+	usage := &atomic.Pointer[openai.CompletionUsage]{}
 
 	go func() {
 		defer stream.Close()
 		defer close(chunks)
 
-		// Read the first event. This is what tells us whether the
-		// upstream stream is actually healthy. If it isn't, surface a
-		// real status code so the router can pick another provider.
 		if !stream.Next() {
 			ok.Store(false)
-			seVal := classifyStreamError(stream.Err())
+			seVal := classifyError(stream.Err())
 			se.Store(&seVal)
 			readyForProcessing <- struct{}{}
 			return
 		}
 
-		// First event read successfully. Stream is alive.
 		ok.Store(true)
 		empty := ServingError{}
 		se.Store(&empty)
-		readyForProcessing <- struct{}{} // upstream очередь чанков начнет разбираться через channel
+		readyForProcessing <- struct{}{}
 
-		// Forward the first chunk we already read above.
+		var acc openai.ChatCompletionAccumulator
+		acc.AddChunk(stream.Current())
 		data, _ := json.Marshal(stream.Current())
-		select { // не блокирует
+		select {
 		case chunks <- data:
 		case <-ctx.Done():
 			return
 		}
 
-		// Pump the rest of the stream. Bail out if the client goes
-		// away so we don't leak a goroutine blocked on a full channel.
 		for stream.Next() {
 			data, _ := json.Marshal(stream.Current())
 			select {
@@ -200,6 +192,11 @@ func ServeStream(
 			case <-ctx.Done():
 				return
 			}
+			acc.AddChunk(stream.Current())
+		}
+
+		if stream.Err() == nil {
+			usage.Store(&acc.Usage)
 		}
 
 		if err := stream.Err(); err != nil && !errors.Is(err, context.Canceled) {
@@ -214,27 +211,22 @@ func ServeStream(
 		}
 	}()
 
-	// Return POINTERS to the shared state. The consumer must read OK
-	// and Err only after receiving from Status, which establishes the
-	// happens-before edge into the producer's writes.
 	return StreamResult{
 		Chunks:             chunks,
-		ReadyForProcessing: readyForProcessing, // это маркер для upstream reader'а о том, что можно начинать работу с результатом
+		ReadyForProcessing: readyForProcessing,
 		OK:                 ok,
 		Err:                se,
+		Usage:              usage,
 	}
 }
 
-// classifyStreamError turns a stream-init failure into a ServingError with
-// a real status code.
-func classifyStreamError(err error) ServingError {
+// classifyError turns an error into a ServingError with a status code.
+// Used by both stream and non-stream requests.
+func classifyError(err error) ServingError {
 	if err == nil {
-		// HTTP 200 but no SSE events were ever produced. Some providers
-		// do this when the model is unavailable. Treat as 502 so the
-		// router picks a different provider.
 		return ServingError{
 			StatusCode:  http.StatusBadGateway,
-			ErrorReason: "upstream stream ended with no data",
+			ErrorReason: "no error but no response",
 		}
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
