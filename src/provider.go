@@ -1,4 +1,4 @@
-package api
+package core
 
 import (
 	"context"
@@ -40,32 +40,41 @@ func newProviderConfig(endpoint string, apiKey string) ProviderConfig {
 
 // Provider methods
 
-func NewProvider(name string, endpoint string, apiKey string, modelAliases map[string][]string, logger *zap.SugaredLogger) *Provider {
-	return &Provider{
-		Name:   name,
-		Config: newProviderConfig(endpoint, apiKey),
-		Models: []*Model{},
-		Client: openai.NewClient(
-			option.WithBaseURL(endpoint),
-			option.WithAPIKey(apiKey),
-			option.WithHTTPClient(&http.Client{
-				Transport: &LoggingTransport{
-					BaseTransport: http.DefaultTransport,
-					Logger:        logger,
-				},
-			}),
-		),
+func NewProvider(name string, endpoint string, apiKey string, modelAliases map[string][]string, customClientHeaders map[string]string, logger *zap.SugaredLogger) *Provider {
+	clientOptions := []option.RequestOption{
+		option.WithBaseURL(endpoint),
+		option.WithAPIKey(apiKey),
+		option.WithHTTPClient(&http.Client{
+			Transport: &LoggingTransport{
+				BaseTransport: http.DefaultTransport,
+				Logger:        logger,
+			},
+		}),
+	}
+
+	for headerKey, headerValue := range customClientHeaders {
+		clientOptions = append(clientOptions, option.WithHeader(headerKey, headerValue))
+	}
+
+	provider := &Provider{
+		Name:         name,
+		Config:       newProviderConfig(endpoint, apiKey),
+		Models:       []*Model{},
+		Client:       openai.NewClient(clientOptions...),
 		ModelAliases: modelAliases,
 		logger:       logger,
 	}
+
+	return provider
 }
 
-func (provider *Provider) LoadModels() {
+func (provider *Provider) LoadModels() bool {
 	ctx := context.Background()
 	provider.logger.Infof("Loading model list for provider %s", provider.Name)
 	modelPage, err := provider.Client.Models.List(ctx)
 	if err != nil {
-		provider.logger.Fatalf("Failed to retrieve models: %v", err)
+		provider.logger.Errorf("Failed to retrieve models: %v", err)
+		return false
 	}
 
 	// Iterate through the pages of models
@@ -82,10 +91,12 @@ func (provider *Provider) LoadModels() {
 		modelPage, err = modelPage.GetNextPage()
 		if err != nil {
 			provider.logger.Fatalf("Failed to get next page: %v", err)
+			return false
 		}
 	}
 
 	provider.logger.Infof("Loaded total %d models from provider %s", len(provider.Models), provider.Name)
+	return true
 }
 
 // Обычный провайдер без доп логики

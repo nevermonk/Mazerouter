@@ -1,86 +1,32 @@
-package api
+package core
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 
 	"github.com/openai/openai-go/v3"
 	"go.uber.org/zap"
 )
 
-func HandleMazeModelsList(pool *ProvidersPool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		models := pool.GetAllModels().ToMazeModelsList()
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(models)
-	}
-}
-
-// Openai API methods
-
-func HandleOpenaiModelsList(pool *ProvidersPool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		models := pool.GetAllModels().ToOpenaiModelsList()
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(models)
-	}
-}
-
-type routeHint struct {
-	Model  string `json:"model"`
-	Stream bool   `json:"stream"`
-}
-
 type servingError struct {
 	StatusCode  int
 	ErrorReason string
 }
 
-// HandleOpenaiCompletions — главный хендлер /v1/chat/completions.
-func HandleOpenaiCompletions(pool *ProvidersPool, logger *zap.SugaredLogger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "failed to read body")
-			return
-		}
-
-		// 1. Быстрый парс только для выбора провайдера
-		var hint routeHint
-		if err := json.Unmarshal(body, &hint); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid JSON")
-			return
-		}
-
-		// 2. Полный парс — напрямую в SDK-тип, без встраивания.
-		// ChatCompletionNewParams поддерживает UnmarshalJSON через apijson.
-		var params openai.ChatCompletionNewParams
-		if err := json.Unmarshal(body, &params); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid params: "+err.Error())
-			return
-		}
-
-		serveCompletionRequest(
-			pool, w, r, hint, params, logger,
-		)
-	}
-}
-
-func serveCompletionRequest(
+func ServeCompletionRequest(
 	pool *ProvidersPool,
 	w http.ResponseWriter,
 	r *http.Request,
-	hint routeHint,
+	hint RouteHint,
 	params openai.ChatCompletionNewParams,
 	logger *zap.SugaredLogger,
 ) {
 	pickedModel := pool.GetModelRoute(hint.Model)
 	if pickedModel == nil {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("no route for model %q", hint.Model))
+		WriteError(w, http.StatusNotFound, fmt.Sprintf("no route for model %q", hint.Model))
 		return
 	}
 
@@ -90,16 +36,15 @@ func serveCompletionRequest(
 		"upstreamModel", pickedModel.Id,
 		"stream", hint.Stream,
 	)
-	// Подменяем model на upstream ID
 	params.Model = openai.ChatModel(pickedModel.Id)
 
 	if hint.Stream {
 		if ok, se := serveStream(w, r.Context(), pickedModel.ProviderRef.Client, params, logger); !ok {
 			logger.Errorf("Model %s of provider %s failed with status code %s and reason '%s'", pickedModel.Id, pickedModel.ProviderRef.Name, se.StatusCode, se.ErrorReason)
-			pickedModel.Awailable = false // показываем, что модель недоступна TBD: проверка доступности
-			serveCompletionRequest(
+			pickedModel.Awailable = false
+			ServeCompletionRequest(
 				pool, w, r, hint, params, logger,
-			) // рекурсивно перезапускаемся
+			)
 			return
 		}
 	} else {
@@ -117,7 +62,7 @@ func serveCompletion(
 	resp, err := client.Chat.Completions.New(ctx, params)
 	if err != nil {
 		logger.Errorw("upstream error", "error", err)
-		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
+		WriteError(w, http.StatusBadGateway, "upstream error: "+err.Error())
 		var apiErr *openai.Error
 		errors.As(err, &apiErr)
 		return false, servingError{
@@ -149,7 +94,6 @@ func serveStream(
 
 	rc := http.NewResponseController(w)
 
-	// Проверяем поддержку flush через контроллер (разворачивает middleware-цепочку)
 	if err := rc.Flush(); err != nil {
 		logger.Errorw("flush not supported", "error", err)
 		return false, servingError{
@@ -163,7 +107,6 @@ func serveStream(
 	completionsAccumulator := openai.ChatCompletionAccumulator{}
 
 	if !stream.Next() {
-		// обарабатываем ошибку при попытке получить первый чанк
 		err := stream.Err()
 
 		var apiErr *openai.Error
@@ -214,7 +157,6 @@ func sendStreamChunk(
 		logger.Errorw("failed to accumulate chunk")
 	}
 
-	// Check if a tool call just finished - useful for logging
 	if finished, ok := acc.JustFinishedToolCall(); ok {
 		logger.Infow("tool call completed",
 			"name", finished.Name,
@@ -231,7 +173,6 @@ func sendStreamChunk(
 	rc.Flush()
 }
 
-// hasAccumulatedContent checks if accumulated response has meaningful content
 func hasAccumulatedContent(cc openai.ChatCompletion) bool {
 	if len(cc.Choices) == 0 {
 		return false
@@ -242,8 +183,7 @@ func hasAccumulatedContent(cc openai.ChatCompletion) bool {
 		len(msg.ToolCalls) > 0
 }
 
-// writeError — OpenAI-совместимый JSON-ответ с ошибкой.
-func writeError(w http.ResponseWriter, status int, msg string) {
+func WriteError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]any{

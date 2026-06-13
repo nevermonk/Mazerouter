@@ -6,7 +6,8 @@ import (
 	"os"
 	"time"
 
-	api "mazerouter/src"
+	core "mazerouter/src"
+	handlers "mazerouter/src/handlers"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -39,13 +40,11 @@ func main() {
 		logger.Fatalf("Failed to parse config file: %v", err)
 	}
 
-	providerPool := api.ProvidersPool{PickStrategy: config.Settings.Providers.PickStrategy}
+	providerPool := core.ProvidersPool{PickStrategy: config.Settings.Providers.PickStrategy}
 	logger.Infof("Provider pick strategy - %s", config.Settings.Providers.PickStrategy)
 	for _, p := range config.Providers {
-		provider := api.NewProvider(p.Name, p.Endpoint, p.APIKey, p.Settings.ModelAliases, logger)
-		go provider.LoadModels()
-
-		providerPool.Providers = append(providerPool.Providers, provider)
+		provider := core.NewProvider(p.Name, p.Endpoint, p.APIKey, p.Settings.ModelAliases, p.Settings.Http.CustomHeaders, logger)
+		go initProvider(&providerPool, provider)
 	}
 
 	logger.Info("Providers initial loading complete")
@@ -53,13 +52,20 @@ func main() {
 	startServing(&providerPool, logger)
 }
 
-func startServing(providerPool *api.ProvidersPool, logger *zap.SugaredLogger) {
+func initProvider(pool *core.ProvidersPool, provider *core.Provider) {
+	loadModelsResult := provider.LoadModels()
+	if loadModelsResult {
+		pool.Providers = append(pool.Providers, provider)
+	}
+}
+
+func startServing(providerPool *core.ProvidersPool, logger *zap.SugaredLogger) {
 	r := chi.NewRouter()
 	r.Use(NewChiZapLoggerMiddleware(logger))
 
-	r.Get("/v1/models", api.HandleMazeModelsList(providerPool))
-	r.Get("/openai/v1/models", api.HandleOpenaiModelsList(providerPool))
-	r.Post("/openai/v1/chat/completions", api.HandleOpenaiCompletions(providerPool, logger))
+	r.Get("/v1/models", handlers.MazeModelsList(providerPool))
+	r.Get("/openai/v1/models", handlers.HandleOpenaiModelsList(providerPool))
+	r.Post("/openai/v1/chat/completions", handlers.HandleOpenaiCompletions(providerPool, logger))
 
 	logger.Info("Server starting on :8080")
 	if err := http.ListenAndServe(":8080", r); err != nil {
@@ -110,7 +116,12 @@ type Provider struct {
 }
 
 type ProviderSettings struct {
-	ModelAliases map[string][]string `yaml:"modelAliases"`
+	ModelAliases map[string][]string  `yaml:"modelAliases"`
+	Http         ProviderSettingsHttp `yaml:"http"`
+}
+
+type ProviderSettingsHttp struct {
+	CustomHeaders map[string]string `yaml:"customHeaders"`
 }
 
 type Settings struct {
