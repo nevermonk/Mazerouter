@@ -17,16 +17,23 @@ type ServingError struct {
 	ErrorReason string
 }
 
+// Результат запроса для non stream запросов
 type CompletionResult struct {
 	Data []byte
 	OK   bool
 	Err  ServingError
 }
 
+// Результат запроса для stream
 type StreamResult struct {
 	Chunks chan []byte
-	OK     bool
-	Err    ServingError
+	// Status receives exactly one value once the producer has decided
+	// whether the stream is healthy (first chunk read succeeded) or
+	// dead (first chunk read failed). The consumer must receive from
+	// Status before reading OK/Err.
+	Status chan struct{}
+	OK     *atomic.Bool
+	Err    *atomic.Pointer[ServingError]
 }
 
 func ServeCompletionRequest(
@@ -50,12 +57,29 @@ func ServeCompletionRequest(
 		"upstreamModel", pickedModel.Id,
 		"stream", stream,
 	)
+
 	params.Model = openai.ChatModel(pickedModel.Id)
 
 	if stream {
 		result := ServeStream(r.Context(), pickedModel.ProviderRef.Client, params, logger)
-		if !result.OK {
-			logger.Errorf("Model %s of provider %s failed with status code %s and reason '%s'", pickedModel.Id, pickedModel.ProviderRef.Name, result.Err.StatusCode, result.Err.ErrorReason)
+
+		// Wait for the producer to know whether the stream is alive.
+		select {
+		case <-result.Status:
+		case <-r.Context().Done():
+			return
+		}
+
+		// Read OK/Err AFTER receiving from Status. The channel
+		// send/recv establishes a happens-before edge into the
+		// producer's writes to OK and Err.
+		if !result.OK.Load() {
+			seVal := ServingError{StatusCode: 0, ErrorReason: ""}
+			if p := result.Err.Load(); p != nil {
+				seVal = *p
+			}
+			logger.Errorf("Model %s of provider %s failed with status code %d and reason '%s'",
+				pickedModel.Id, pickedModel.ProviderRef.Name, seVal.StatusCode, seVal.ErrorReason)
 			pickedModel.Awailable = false
 			ServeCompletionRequest(pool, w, r, model, stream, params, logger)
 			return
@@ -68,14 +92,19 @@ func ServeCompletionRequest(
 		w.WriteHeader(http.StatusOK)
 
 		rc := http.NewResponseController(w)
+
 		for chunk := range result.Chunks {
-			logger.Infow("Writing sse chunk back to user...")
 			fmt.Fprintf(w, "data: %s\n\n", chunk)
-			rc.Flush()
+			if err := rc.Flush(); err != nil {
+				logger.Warnw("flush failed, client likely disconnected", "error", err)
+				return
+			}
 		}
 		fmt.Fprint(w, "data: [DONE]\n\n")
-		rc.Flush()
-	} else {
+		_ = rc.Flush()
+		return
+	} else { // non stream запрос
+
 		result := ServeCompletion(r.Context(), pickedModel.ProviderRef.Client, params, logger)
 		if !result.OK {
 			WriteError(w, http.StatusBadGateway, "upstream error: "+result.Err.ErrorReason)
@@ -95,12 +124,15 @@ func ServeCompletion(
 	resp, err := client.Chat.Completions.New(ctx, params)
 	if err != nil {
 		logger.Errorw("upstream error", "error", err)
+		statusCode := 0
 		var apiErr *openai.Error
-		errors.As(err, &apiErr)
+		if errors.As(err, &apiErr) {
+			statusCode = apiErr.StatusCode
+		}
 		return CompletionResult{
 			OK: false,
 			Err: ServingError{
-				StatusCode:  apiErr.StatusCode,
+				StatusCode:  statusCode,
 				ErrorReason: "Upstream Error",
 			},
 		}
@@ -122,51 +154,97 @@ func ServeStream(
 	logger *zap.SugaredLogger,
 ) StreamResult {
 	stream := client.Chat.Completions.NewStreaming(ctx, params)
+	// Buffered so the producer rarely blocks on the first send before
+	// the consumer starts reading.
+	chunks := make(chan []byte, 64)
+	status := make(chan struct{}, 1)
 
-	chunks := make(chan []byte)
-	var ok atomic.Bool
-	var se ServingError
+	ok := &atomic.Bool{}
+	se := &atomic.Pointer[ServingError]{}
 
 	go func() {
 		defer stream.Close()
 		defer close(chunks)
 
+		// Read the first event. This is what tells us whether the
+		// upstream stream is actually healthy. If it isn't, surface a
+		// real status code so the router can pick another provider.
 		if !stream.Next() {
-			err := stream.Err()
-			var apiErr *openai.Error
-			if errors.As(err, &apiErr) && apiErr.StatusCode == 429 {
-				ok.Store(false)
-				se = ServingError{
-					StatusCode:  429,
-					ErrorReason: "Too many requests for model",
-				}
-			}
+			ok.Store(false)
+			seVal := classifyStreamError(stream.Err())
+			se.Store(&seVal)
+			status <- struct{}{}
 			return
 		}
 
+		// First event read successfully. Stream is alive.
 		ok.Store(true)
-		firstChunk := stream.Current()
-		data, _ := json.Marshal(firstChunk)
-		chunks <- data
+		empty := ServingError{}
+		se.Store(&empty)
+		status <- struct{}{}
 
+		// Forward the first chunk we already read above.
+		data, _ := json.Marshal(stream.Current())
+		select {
+		case chunks <- data:
+		case <-ctx.Done():
+			return
+		}
+
+		// Pump the rest of the stream. Bail out if the client goes
+		// away so we don't leak a goroutine blocked on a full channel.
 		for stream.Next() {
-			chunk := stream.Current()
-			data, _ := json.Marshal(chunk)
-			chunks <- data
+			data, _ := json.Marshal(stream.Current())
+			select {
+			case chunks <- data:
+			case <-ctx.Done():
+				return
+			}
 		}
 
 		if err := stream.Err(); err != nil && !errors.Is(err, context.Canceled) {
-			logger.Errorw("stream error", "error", err)
+			logger.Errorw("stream error mid-flight", "error", err)
 			errJSON, _ := json.Marshal(map[string]any{
 				"error": map[string]string{"message": err.Error(), "type": "stream_error"},
 			})
-			chunks <- errJSON
+			select {
+			case chunks <- errJSON:
+			case <-ctx.Done():
+			}
 		}
 	}()
 
-	<-ctx.Done()
+	// Return POINTERS to the shared state. The consumer must read OK
+	// and Err only after receiving from Status, which establishes the
+	// happens-before edge into the producer's writes.
+	return StreamResult{
+		Chunks: chunks,
+		Status: status,
+		OK:     ok,
+		Err:    se,
+	}
+}
 
-	return StreamResult{Chunks: chunks, OK: ok.Load(), Err: se}
+// classifyStreamError turns a stream-init failure into a ServingError with
+// a real status code.
+func classifyStreamError(err error) ServingError {
+	if err == nil {
+		// HTTP 200 but no SSE events were ever produced. Some providers
+		// do this when the model is unavailable. Treat as 502 so the
+		// router picks a different provider.
+		return ServingError{
+			StatusCode:  http.StatusBadGateway,
+			ErrorReason: "upstream stream ended with no data",
+		}
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return ServingError{StatusCode: 0, ErrorReason: "client cancelled"}
+	}
+	var apiErr *openai.Error
+	if errors.As(err, &apiErr) && apiErr.StatusCode != 0 {
+		return ServingError{StatusCode: apiErr.StatusCode, ErrorReason: "Upstream Error"}
+	}
+	return ServingError{StatusCode: http.StatusBadGateway, ErrorReason: err.Error()}
 }
 
 func WriteError(w http.ResponseWriter, status int, msg string) {
