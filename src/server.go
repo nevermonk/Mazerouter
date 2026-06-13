@@ -27,13 +27,13 @@ type CompletionResult struct {
 // Результат запроса для stream
 type StreamResult struct {
 	Chunks chan []byte
-	// Status receives exactly one value once the producer has decided
+	// ReadyForProcessing receives exactly one value once the producer has decided
 	// whether the stream is healthy (first chunk read succeeded) or
 	// dead (first chunk read failed). The consumer must receive from
-	// Status before reading OK/Err.
-	Status chan struct{}
-	OK     *atomic.Bool
-	Err    *atomic.Pointer[ServingError]
+	// ReadyForProcessing before reading OK/Err.
+	ReadyForProcessing chan struct{}
+	OK                 *atomic.Bool
+	Err                *atomic.Pointer[ServingError]
 }
 
 func ServeCompletionRequest(
@@ -65,7 +65,7 @@ func ServeCompletionRequest(
 
 		// Wait for the producer to know whether the stream is alive.
 		select {
-		case <-result.Status:
+		case <-result.ReadyForProcessing:
 		case <-r.Context().Done():
 			return
 		}
@@ -156,8 +156,8 @@ func ServeStream(
 	stream := client.Chat.Completions.NewStreaming(ctx, params)
 	// Buffered so the producer rarely blocks on the first send before
 	// the consumer starts reading.
-	chunks := make(chan []byte, 64)
-	status := make(chan struct{}, 1)
+	chunks := make(chan []byte, 64)              // труба выдерживает 64 символа
+	readyForProcessing := make(chan struct{}, 1) // это просто сигнал для upstream reader'а, что мы готовы начать работу с результатом стрима (положительным или нет)
 
 	ok := &atomic.Bool{}
 	se := &atomic.Pointer[ServingError]{}
@@ -173,7 +173,7 @@ func ServeStream(
 			ok.Store(false)
 			seVal := classifyStreamError(stream.Err())
 			se.Store(&seVal)
-			status <- struct{}{}
+			readyForProcessing <- struct{}{}
 			return
 		}
 
@@ -181,11 +181,11 @@ func ServeStream(
 		ok.Store(true)
 		empty := ServingError{}
 		se.Store(&empty)
-		status <- struct{}{}
+		readyForProcessing <- struct{}{} // upstream очередь чанков начнет разбираться через channel
 
 		// Forward the first chunk we already read above.
 		data, _ := json.Marshal(stream.Current())
-		select {
+		select { // не блокирует
 		case chunks <- data:
 		case <-ctx.Done():
 			return
@@ -218,10 +218,10 @@ func ServeStream(
 	// and Err only after receiving from Status, which establishes the
 	// happens-before edge into the producer's writes.
 	return StreamResult{
-		Chunks: chunks,
-		Status: status,
-		OK:     ok,
-		Err:    se,
+		Chunks:             chunks,
+		ReadyForProcessing: readyForProcessing, // это маркер для upstream reader'а о том, что можно начинать работу с результатом
+		OK:                 ok,
+		Err:                se,
 	}
 }
 
