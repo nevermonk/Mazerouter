@@ -7,11 +7,6 @@ import (
 	"github.com/openai/openai-go/v3"
 )
 
-type RouteHint struct {
-	Model  string `json:"model"`
-	Stream bool   `json:"stream"`
-}
-
 type Model struct {
 	Id          string
 	OpenaiObj   openai.Model

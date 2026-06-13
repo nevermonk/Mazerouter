@@ -10,6 +10,11 @@ import (
 	"go.uber.org/zap"
 )
 
+type RouteHint struct {
+	Model  string `json:"model"`
+	Stream bool   `json:"stream"`
+}
+
 func HandleOpenaiModelsList(pool *core.ProvidersPool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		models := pool.GetAllModels().ToOpenaiModelsList()
@@ -27,7 +32,7 @@ func HandleOpenaiCompletions(pool *core.ProvidersPool, logger *zap.SugaredLogger
 			return
 		}
 
-		var hint core.RouteHint
+		var hint RouteHint
 		if err := json.Unmarshal(body, &hint); err != nil {
 			core.WriteError(w, http.StatusBadRequest, "invalid JSON")
 			return
@@ -40,7 +45,7 @@ func HandleOpenaiCompletions(pool *core.ProvidersPool, logger *zap.SugaredLogger
 		}
 
 		core.ServeCompletionRequest(
-			pool, w, r, hint, params, logger,
+			pool, w, r, hint.Model, hint.Stream, params, logger,
 		)
 	}
 }

@@ -6,181 +6,167 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync/atomic"
 
 	"github.com/openai/openai-go/v3"
 	"go.uber.org/zap"
 )
 
-type servingError struct {
+type ServingError struct {
 	StatusCode  int
 	ErrorReason string
+}
+
+type CompletionResult struct {
+	Data []byte
+	OK   bool
+	Err  ServingError
+}
+
+type StreamResult struct {
+	Chunks chan []byte
+	OK     bool
+	Err    ServingError
 }
 
 func ServeCompletionRequest(
 	pool *ProvidersPool,
 	w http.ResponseWriter,
 	r *http.Request,
-	hint RouteHint,
+	model string,
+	stream bool,
 	params openai.ChatCompletionNewParams,
 	logger *zap.SugaredLogger,
 ) {
-	pickedModel := pool.GetModelRoute(hint.Model)
+	pickedModel := pool.GetModelRoute(model)
 	if pickedModel == nil {
-		WriteError(w, http.StatusNotFound, fmt.Sprintf("no route for model %q", hint.Model))
+		WriteError(w, http.StatusNotFound, fmt.Sprintf("no route for model %q", model))
 		return
 	}
 
 	logger.Infow("routing",
-		"incoming", hint.Model,
+		"incoming", model,
 		"provider", pickedModel.ProviderRef.Name,
 		"upstreamModel", pickedModel.Id,
-		"stream", hint.Stream,
+		"stream", stream,
 	)
 	params.Model = openai.ChatModel(pickedModel.Id)
 
-	if hint.Stream {
-		if ok, se := serveStream(w, r.Context(), pickedModel.ProviderRef.Client, params, logger); !ok {
-			logger.Errorf("Model %s of provider %s failed with status code %s and reason '%s'", pickedModel.Id, pickedModel.ProviderRef.Name, se.StatusCode, se.ErrorReason)
+	if stream {
+		result := ServeStream(r.Context(), pickedModel.ProviderRef.Client, params, logger)
+		if !result.OK {
+			logger.Errorf("Model %s of provider %s failed with status code %s and reason '%s'", pickedModel.Id, pickedModel.ProviderRef.Name, result.Err.StatusCode, result.Err.ErrorReason)
 			pickedModel.Awailable = false
-			ServeCompletionRequest(
-				pool, w, r, hint, params, logger,
-			)
+			ServeCompletionRequest(pool, w, r, model, stream, params, logger)
 			return
 		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+
+		rc := http.NewResponseController(w)
+		for chunk := range result.Chunks {
+			logger.Infow("Writing sse chunk back to user...")
+			fmt.Fprintf(w, "data: %s\n\n", chunk)
+			rc.Flush()
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		rc.Flush()
 	} else {
-		serveCompletion(w, r.Context(), pickedModel.ProviderRef.Client, params, logger)
+		result := ServeCompletion(r.Context(), pickedModel.ProviderRef.Client, params, logger)
+		if !result.OK {
+			WriteError(w, http.StatusBadGateway, "upstream error: "+result.Err.ErrorReason)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(result.Data)
 	}
 }
 
-func serveCompletion(
-	w http.ResponseWriter,
+func ServeCompletion(
 	ctx context.Context,
 	client openai.Client,
 	params openai.ChatCompletionNewParams,
 	logger *zap.SugaredLogger,
-) (bool, servingError) {
+) CompletionResult {
 	resp, err := client.Chat.Completions.New(ctx, params)
 	if err != nil {
 		logger.Errorw("upstream error", "error", err)
-		WriteError(w, http.StatusBadGateway, "upstream error: "+err.Error())
 		var apiErr *openai.Error
 		errors.As(err, &apiErr)
-		return false, servingError{
-			StatusCode:  apiErr.StatusCode,
-			ErrorReason: "Upstream Error",
+		return CompletionResult{
+			OK: false,
+			Err: ServingError{
+				StatusCode:  apiErr.StatusCode,
+				ErrorReason: "Upstream Error",
+			},
 		}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
+	data, err := json.Marshal(resp)
+	if err != nil {
 		logger.Errorw("encode response error", "error", err)
+		return CompletionResult{OK: false}
 	}
 
-	return true, servingError{}
+	return CompletionResult{Data: data, OK: true}
 }
 
-func serveStream(
-	w http.ResponseWriter,
+func ServeStream(
 	ctx context.Context,
 	client openai.Client,
 	params openai.ChatCompletionNewParams,
 	logger *zap.SugaredLogger,
-) (bool, servingError) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-
-	rc := http.NewResponseController(w)
-
-	if err := rc.Flush(); err != nil {
-		logger.Errorw("flush not supported", "error", err)
-		return false, servingError{
-			ErrorReason: "Streaming unsupported for model",
-		}
-	}
-
+) StreamResult {
 	stream := client.Chat.Completions.NewStreaming(ctx, params)
-	defer stream.Close()
 
-	completionsAccumulator := openai.ChatCompletionAccumulator{}
+	chunks := make(chan []byte)
+	var ok atomic.Bool
+	var se ServingError
 
-	if !stream.Next() {
-		err := stream.Err()
+	go func() {
+		defer stream.Close()
+		defer close(chunks)
 
-		var apiErr *openai.Error
-		errors.As(err, &apiErr)
-
-		if apiErr.StatusCode == 429 {
-			return false, servingError{
-				StatusCode:  429,
-				ErrorReason: "Too many requests for model",
+		if !stream.Next() {
+			err := stream.Err()
+			var apiErr *openai.Error
+			if errors.As(err, &apiErr) && apiErr.StatusCode == 429 {
+				ok.Store(false)
+				se = ServingError{
+					StatusCode:  429,
+					ErrorReason: "Too many requests for model",
+				}
 			}
+			return
 		}
-		stream.Close()
-	} else {
+
+		ok.Store(true)
 		firstChunk := stream.Current()
-		sendStreamChunk(w, rc, firstChunk, &completionsAccumulator, logger)
+		data, _ := json.Marshal(firstChunk)
+		chunks <- data
+
 		for stream.Next() {
 			chunk := stream.Current()
-			sendStreamChunk(w, rc, chunk, &completionsAccumulator, logger)
+			data, _ := json.Marshal(chunk)
+			chunks <- data
 		}
-	}
 
-	switch err := stream.Err(); {
-	case err == nil:
-		fmt.Fprint(w, "data: [DONE]\n\n")
-		rc.Flush()
-	case err == context.Canceled:
-		logger.Infow("client disconnected")
-	default:
-		logger.Errorw("stream error", "error", err)
-		errJSON, _ := json.Marshal(map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "stream_error"},
-		})
-		fmt.Fprintf(w, "data: %s\n\n", errJSON)
-		rc.Flush()
-	}
+		if err := stream.Err(); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Errorw("stream error", "error", err)
+			errJSON, _ := json.Marshal(map[string]any{
+				"error": map[string]string{"message": err.Error(), "type": "stream_error"},
+			})
+			chunks <- errJSON
+		}
+	}()
 
-	return true, servingError{}
-}
+	<-ctx.Done()
 
-func sendStreamChunk(
-	w http.ResponseWriter,
-	rc *http.ResponseController,
-	chunk openai.ChatCompletionChunk,
-	acc *openai.ChatCompletionAccumulator,
-	logger *zap.SugaredLogger,
-) {
-	if !acc.AddChunk(chunk) {
-		logger.Errorw("failed to accumulate chunk")
-	}
-
-	if finished, ok := acc.JustFinishedToolCall(); ok {
-		logger.Infow("tool call completed",
-			"name", finished.Name,
-			"args", finished.Arguments,
-		)
-	}
-
-	data, err := json.Marshal(chunk)
-	if err != nil {
-		logger.Errorw("marshal chunk error", "error", err)
-		return
-	}
-	fmt.Fprintf(w, "data: %s\n\n", data)
-	rc.Flush()
-}
-
-func hasAccumulatedContent(cc openai.ChatCompletion) bool {
-	if len(cc.Choices) == 0 {
-		return false
-	}
-	msg := cc.Choices[0].Message
-	return msg.Content != "" ||
-		msg.Role != "" ||
-		len(msg.ToolCalls) > 0
+	return StreamResult{Chunks: chunks, OK: ok.Load(), Err: se}
 }
 
 func WriteError(w http.ResponseWriter, status int, msg string) {
